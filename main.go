@@ -17,7 +17,7 @@ import (
 	"unicode/utf16"
 )
 
-const version = "1.3.0"
+const version = "1.3.1"
 
 // ── Encoding ──────────────────────────────────────────────────────────────────
 
@@ -129,6 +129,20 @@ func rcUnescapeQuotes(s string) string {
 
 func rcEscapeQuotes(s string) string {
 	return strings.ReplaceAll(s, `"`, `""`)
+}
+
+// rcEscapeLiteral prepares a translation for insertion into an RC string
+// literal. It doubles embedded quotes (rcEscapeQuotes) and, as a safety net
+// against a human hand-editing the JSON or a .po file, turns any raw
+// newline/carriage-return byte into the RC "\n" escape sequence — a literal
+// newline inside a quoted RC string is invalid and would corrupt the file
+// (everything after it silently falls outside the intended string literal).
+func rcEscapeLiteral(s string) string {
+	s = rcEscapeQuotes(s)
+	s = strings.ReplaceAll(s, "\r\n", `\n`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\n`)
+	return s
 }
 
 // ── Escape protection ─────────────────────────────────────────────────────────
@@ -306,7 +320,7 @@ func apply(content string, translations map[string]Entry) (string, ApplyStats) {
 				return entry
 			}
 			stats.Applied++
-			return strings.Replace(entry, `"`+m[2]+`"`, `"`+rcEscapeQuotes(e.Translation)+`"`, 1)
+			return strings.Replace(entry, `"`+m[2]+`"`, `"`+rcEscapeLiteral(e.Translation)+`"`, 1)
 		})
 	})
 
@@ -314,12 +328,21 @@ func apply(content string, translations map[string]Entry) (string, ApplyStats) {
 		if strings.HasPrefix(key, "__ST_") {
 			continue
 		}
+		if strings.HasPrefix(key, "~REMOVED~") {
+			// Obsolete entries from cmdMerge — the string they refer to no
+			// longer exists in this .rc file. Without this guard, apply()
+			// would still try a blind literal-text replace using their
+			// (possibly stale) translation, which could wrongly match some
+			// unrelated string elsewhere in the file that happens to share
+			// the same original text.
+			continue
+		}
 		if e.Translation == e.Original || strings.TrimSpace(e.Translation) == "" {
 			stats.Skipped++
 			continue
 		}
 		old := `"` + rcEscapeQuotes(e.Original) + `"`
-		new_ := `"` + rcEscapeQuotes(e.Translation) + `"`
+		new_ := `"` + rcEscapeLiteral(e.Translation) + `"`
 		n := 0
 		content, n = replaceOutsideStringTable(content, old, new_)
 		if n == 0 {
@@ -402,21 +425,33 @@ func unescapePO(s string) string {
 	return b.String()
 }
 
-func exportPO(entries map[string]Entry, outPath, srcLang, dstLang string) error {
+// exportPO writes entries to a .po file and returns how many were actually
+// written. Entries produced by cmdMerge for strings no longer present in the
+// .rc file are prefixed "~REMOVED~" in the JSON — those are intentionally
+// skipped here. If they were exported, importPO would have no way to tell
+// they were obsolete (msgctxt only carries the STRINGTABLE id, not the
+// removal marker), and a round-trip through Poedit/Weblate would silently
+// turn them back into live, but wrongly-keyed, entries.
+func exportPO(entries map[string]Entry, outPath, srcLang, dstLang string) (int, error) {
 	f, err := os.Create(outPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 	w := bufio.NewWriter(f)
 	fmt.Fprintf(w, "# Wolf RPG Editor translation\n# Source: %s  Target: %s\n#\nmsgid \"\"\nmsgstr \"\"\n\"Content-Type: text/plain; charset=UTF-8\\n\"\n\"Content-Transfer-Encoding: 8bit\\n\"\n\"Language: %s\\n\"\n\"MIME-Version: 1.0\\n\"\n\n", srcLang, dstLang, dstLang)
+	exported := 0
 	for key, e := range entries {
+		if strings.HasPrefix(key, "~REMOVED~") {
+			continue
+		}
 		if strings.HasPrefix(key, "__ST_") {
 			fmt.Fprintf(w, "msgctxt \"%s\"\n", strings.TrimPrefix(key, "__ST_"))
 		}
 		fmt.Fprintf(w, "msgid \"%s\"\nmsgstr \"%s\"\n\n", escapePO(e.Original), escapePO(e.Translation))
+		exported++
 	}
-	return w.Flush()
+	return exported, w.Flush()
 }
 
 func importPO(path string) (map[string]Entry, error) {
@@ -561,6 +596,10 @@ func cmdMerge(rcPath, jsonPath string) error {
 }
 
 func cmdTranslate(jsonPath, outPath, fromLang, toLang string, workers int) error {
+	if workers < 1 {
+		fmt.Printf("  Warning: --workers %d is invalid, using 1 worker instead\n", workers)
+		workers = 1
+	}
 	data, err := os.ReadFile(jsonPath)
 	if err != nil {
 		return fmt.Errorf("cannot read %s: %w", jsonPath, err)
@@ -678,10 +717,14 @@ func cmdExportPO(jsonPath, outPath, srcLang, dstLang string) error {
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
 	}
-	if err := exportPO(entries, outPath, srcLang, dstLang); err != nil {
+	exported, err := exportPO(entries, outPath, srcLang, dstLang)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("Exported %d entries -> %s\n", len(entries), outPath)
+	fmt.Printf("Exported %d entries -> %s\n", exported, outPath)
+	if skipped := len(entries) - exported; skipped > 0 {
+		fmt.Printf("  Skipped %d obsolete (~REMOVED~) entries — not sent to the translator.\n", skipped)
+	}
 	fmt.Println("Open with Poedit, Weblate, or any gettext-compatible editor.")
 	return nil
 }
@@ -753,10 +796,20 @@ Workflows:
 
 func parseFlags(args []string) map[string]string {
 	flags := map[string]string{"--from": "en", "--to": "ru", "--workers": "10"}
-	for i := 0; i < len(args)-1; i++ {
-		if _, ok := flags[args[i]]; ok {
-			flags[args[i]] = args[i+1]
+	for i := 0; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "--") {
+			continue
 		}
+		if _, ok := flags[args[i]]; !ok {
+			fmt.Fprintf(os.Stderr, "  Warning: unknown flag %s (ignored)\n", args[i])
+			continue
+		}
+		if i+1 >= len(args) {
+			fmt.Fprintf(os.Stderr, "  Warning: flag %s has no value (ignored)\n", args[i])
+			continue
+		}
+		flags[args[i]] = args[i+1]
+		i++
 	}
 	return flags
 }
